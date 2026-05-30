@@ -34,9 +34,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+# Giữ terminal Colab sạch: ẩn log INFO/WARN kiểu XLA/cuDNN algorithm picker.
+# Đổi bằng biến môi trường NST_TF_CPP_MIN_LOG_LEVEL nếu thật sự cần debug sâu.
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = os.environ.get("NST_TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("AUTOGRAPH_VERBOSITY", "0")
+
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+
+# Ẩn bớt logger Python của TensorFlow, chỉ giữ lỗi quan trọng.
+tf.get_logger().setLevel("ERROR")
 
 
 # =========================================================
@@ -83,6 +92,8 @@ class TrainConfig:
     student_base_filters: int = 24
     hard_loss_weight: float = 0.65
     distill_loss_weight: float = 0.35
+    show_summary: bool = False
+    fit_verbose: int = 0
 
 
 def enable_mixed_precision(use_amp: bool) -> None:
@@ -644,16 +655,125 @@ def eval_all_splits(model: keras.Model, dataset_dir: Path, batch_size: int, repo
 # TRAIN HELPERS
 # =========================================================
 
-def make_callbacks(results_dir: Path, role: str, patience: int, append_log: bool) -> List[keras.callbacks.Callback]:
+def _get_log_value(logs: Optional[Dict[str, float]], *names: str) -> Optional[float]:
+    if not logs:
+        return None
+    lower_map = {str(k).lower(): v for k, v in logs.items()}
+    for name in names:
+        key = name.lower()
+        if key in lower_map:
+            try:
+                return float(lower_map[key])
+            except Exception:
+                return None
+    return None
+
+
+def _fmt_metric(value: Optional[float], percent: bool = False, sci: bool = False) -> str:
+    if value is None:
+        return "-"
+    if sci:
+        return f"{value:.2e}"
+    if percent:
+        return f"{value * 100:.2f}%"
+    return f"{value:.4f}"
+
+
+class CleanEpochLogger(keras.callbacks.Callback):
+    """In log gọn, tránh progress bar Keras bị vỡ ký tự trên Colab terminal."""
+
+    def __init__(self, role: str, target_epochs: int, batch_log_every: int = 5):
+        super().__init__()
+        self.role = role
+        self.target_epochs = target_epochs
+        self.batch_log_every = batch_log_every
+        self.epoch_start_time = 0.0
+        self.current_epoch = 0
+
+    def on_epoch_begin(self, epoch: int, logs=None):
+        self.current_epoch = epoch + 1
+        self.epoch_start_time = __import__("time").time()
+        steps = self.params.get("steps", "?")
+        print(f"[EPOCH][{self.role}] {self.current_epoch:03d}/{self.target_epochs:03d} started | steps={steps}", flush=True)
+
+    def on_train_batch_end(self, batch: int, logs=None):
+        steps = self.params.get("steps")
+        step = batch + 1
+        should_print = step == 1 or (self.batch_log_every > 0 and step % self.batch_log_every == 0) or (steps and step == steps)
+        if not should_print:
+            return
+        step_text = f"{step}/{steps}" if steps else str(step)
+        print(
+            f"[BATCH][{self.role}] epoch {self.current_epoch:03d}/{self.target_epochs:03d} "
+            f"step {step_text} "
+            f"| loss={_fmt_metric(_get_log_value(logs, 'loss'))} "
+            f"| diceABC={_fmt_metric(_get_log_value(logs, 'mean_dice_abc'))} "
+            f"| C={_fmt_metric(_get_log_value(logs, 'dice_C', 'dice_c'))}",
+            flush=True,
+        )
+
+    def on_epoch_end(self, epoch: int, logs=None):
+        import time as _time
+
+        elapsed = _time.time() - self.epoch_start_time
+        lr = _get_log_value(logs, "learning_rate", "lr")
+        line = (
+            f"[EPOCH][{self.role}] {epoch + 1:03d}/{self.target_epochs:03d} done "
+            f"| {elapsed:6.1f}s "
+            f"| loss={_fmt_metric(_get_log_value(logs, 'loss'))} "
+            f"| diceABC={_fmt_metric(_get_log_value(logs, 'mean_dice_abc'))} "
+            f"| C={_fmt_metric(_get_log_value(logs, 'dice_C', 'dice_c'))} "
+            f"| val_loss={_fmt_metric(_get_log_value(logs, 'val_loss'))} "
+            f"| val_diceABC={_fmt_metric(_get_log_value(logs, 'val_mean_dice_abc'))} "
+            f"| val_C={_fmt_metric(_get_log_value(logs, 'val_dice_C', 'val_dice_c'))} "
+            f"| val_acc={_fmt_metric(_get_log_value(logs, 'val_pixel_acc_abc'), percent=True)} "
+            f"| lr={_fmt_metric(lr, sci=True)}"
+        )
+        print(line, flush=True)
+
+
+class CleanEventLogger(keras.callbacks.Callback):
+    """Thông báo khi best/early-stop/reduce-lr thay đổi, thay cho verbose dài của Keras."""
+
+    def __init__(self, role: str, monitor: str = "val_mean_dice_abc"):
+        super().__init__()
+        self.role = role
+        self.monitor = monitor
+        self.best = -float("inf")
+
+    def on_epoch_end(self, epoch: int, logs=None):
+        current = _get_log_value(logs, self.monitor)
+        if current is not None and current > self.best:
+            self.best = current
+            print(f"[BEST][{self.role}] epoch {epoch + 1:03d}: {self.monitor}={current:.4f}", flush=True)
+
+
+def print_model_brief(model: keras.Model, role: str, show_summary: bool = False) -> None:
+    if show_summary:
+        model.summary()
+        return
+    total = model.count_params()
+    trainable = int(np.sum([np.prod(v.shape) for v in model.trainable_weights]))
+    non_trainable = total - trainable
+    print(
+        f"[MODEL][{role}] {model.name} | params={total:,} "
+        f"| trainable={trainable:,} | non_trainable={non_trainable:,}",
+        flush=True,
+    )
+
+
+def make_callbacks(results_dir: Path, role: str, patience: int, append_log: bool, target_epochs: int) -> List[keras.callbacks.Callback]:
     checkpoint_dir = results_dir / f"checkpoints_{role}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     return [
+        CleanEpochLogger(role=role, target_epochs=target_epochs),
+        CleanEventLogger(role=role),
         keras.callbacks.ModelCheckpoint(
             filepath=str(results_dir / f"best_{role}.keras"),
             monitor="val_mean_dice_abc",
             mode="max",
             save_best_only=True,
-            verbose=1,
+            verbose=0,
         ),
         keras.callbacks.ModelCheckpoint(
             filepath=str(checkpoint_dir / "epoch_{epoch:03d}.keras"),
@@ -666,7 +786,7 @@ def make_callbacks(results_dir: Path, role: str, patience: int, append_log: bool
             mode="max",
             patience=patience,
             restore_best_weights=True,
-            verbose=1,
+            verbose=0,
         ),
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_mean_dice_abc",
@@ -674,7 +794,7 @@ def make_callbacks(results_dir: Path, role: str, patience: int, append_log: bool
             factor=0.5,
             patience=max(3, patience // 4),
             min_lr=1e-6,
-            verbose=1,
+            verbose=0,
         ),
         keras.callbacks.CSVLogger(
             filename=str(results_dir / "logs" / f"{role}_train_log.csv"),
@@ -693,19 +813,21 @@ def train_role(
     val_ds: tf.data.Dataset,
     results_dir: Path,
     patience: int,
+    fit_verbose: int = 0,
 ) -> keras.Model:
     if target_epochs <= initial_epoch:
         print(f"[TRAIN][{role}] target_epochs={target_epochs} <= initial_epoch={initial_epoch}, skip fit.")
         return model
 
     print(f"[TRAIN][{role}] Fit from epoch {initial_epoch + 1} to {target_epochs}")
+    print(f"[TRAIN][{role}] Keras progress bar disabled. Full metrics are saved in results/logs/{role}_train_log.csv")
     model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=target_epochs,
         initial_epoch=initial_epoch,
-        callbacks=make_callbacks(results_dir, role=role, patience=patience, append_log=initial_epoch > 0),
-        verbose=1,
+        callbacks=make_callbacks(results_dir, role=role, patience=patience, append_log=initial_epoch > 0, target_epochs=target_epochs),
+        verbose=fit_verbose,
     )
     final_path = results_dir / f"final_{role}.keras"
     model.save(final_path)
@@ -777,6 +899,8 @@ def main(args: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--student-base-filters", type=int, default=24)
     parser.add_argument("--hard-loss-weight", type=float, default=0.65)
     parser.add_argument("--distill-loss-weight", type=float, default=0.35)
+    parser.add_argument("--show-summary", action="store_true", help="In full model.summary(). Mặc định tắt để terminal sạch.")
+    parser.add_argument("--fit-verbose", type=int, default=0, choices=[0, 1, 2], help="Keras fit verbose. Mặc định 0 vì đã có CleanEpochLogger.")
     ns = parser.parse_args(args)
 
     cfg = TrainConfig(
@@ -797,6 +921,8 @@ def main(args: Optional[Sequence[str]] = None) -> None:
         student_base_filters=ns.student_base_filters,
         hard_loss_weight=ns.hard_loss_weight,
         distill_loss_weight=ns.distill_loss_weight,
+        show_summary=ns.show_summary,
+        fit_verbose=ns.fit_verbose,
     )
 
     dataset_dir = Path(cfg.dataset_dir)
@@ -828,7 +954,7 @@ def main(args: Optional[Sequence[str]] = None) -> None:
             base_filters=cfg.teacher_base_filters,
             compile_fn=teacher_compile,
         )
-        teacher_model.summary()
+        print_model_brief(teacher_model, "teacher", show_summary=cfg.show_summary)
     else:
         teacher_model = load_best_if_exists(results_dir, "teacher", teacher_compile)
 
@@ -841,7 +967,7 @@ def main(args: Optional[Sequence[str]] = None) -> None:
             base_filters=cfg.student_base_filters,
             compile_fn=student_compile,
         )
-        student_model.summary()
+        print_model_brief(student_model, "student", show_summary=cfg.show_summary)
 
     target_epochs = cfg.epochs
     best_role = "teacher"
@@ -860,6 +986,7 @@ def main(args: Optional[Sequence[str]] = None) -> None:
                 val_ds=val_ds,
                 results_dir=results_dir,
                 patience=cfg.patience,
+                fit_verbose=cfg.fit_verbose,
             )
             teacher_model = load_best_if_exists(results_dir, "teacher", teacher_compile)
         elif teacher_model is not None:
@@ -881,6 +1008,7 @@ def main(args: Optional[Sequence[str]] = None) -> None:
                 val_ds=val_ds_student,
                 results_dir=results_dir,
                 patience=cfg.patience,
+                fit_verbose=cfg.fit_verbose,
             )
             student_model = load_best_if_exists(results_dir, "student", student_compile)
 
