@@ -4,7 +4,7 @@ Apply model vào ảnh overlap_raw, xuất mask/overlay và tách thành 2 file 
 
 Điểm mới:
 - Path lấy theo vị trí file script, không phụ thuộc đang đứng ở folder nào.
-- Ưu tiên load results/best_for_apply.keras, rồi best_student/teacher/unet.
+- Ưu tiên load bản predict nhẹ results/best_for_apply_inference.keras hoặc best_for_apply.keras, rồi mới tới best_student/teacher.
 - Model predict ở 256 padding, sau đó map mask về kích thước ảnh gốc.
 - Sau khi label A/B/C, tạo 2 file cùng thư mục separated_chromosomes:
     <ten_anh_goc>_A.png
@@ -45,7 +45,10 @@ THRESH_B = 0.50
 THRESH_C = 0.40
 
 MODEL_CANDIDATES = [
+    RESULTS_DIR / "best_for_apply_inference.keras",
     RESULTS_DIR / "best_for_apply.keras",
+    RESULTS_DIR / "best_student_inference.keras",
+    RESULTS_DIR / "best_teacher_inference.keras",
     RESULTS_DIR / "best_student.keras",
     RESULTS_DIR / "best_teacher.keras",
     RESULTS_DIR / "best_hybrid_unet.keras",

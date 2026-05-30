@@ -8,16 +8,19 @@ Bản này dùng đúng hướng teacher-student:
 - Student học hard label + soft label từ Teacher để giữ shape A/B tốt hơn nhưng vẫn giữ mạnh C.
 - Output chính vẫn là A, B, C. Edge chỉ là channel phụ để học biên.
 - Resume tự động: tìm checkpoints_teacher/epoch_*.keras và checkpoints_student/epoch_*.keras.
-- Batch/Epoch mặc định: 64 / 200.
+- Checkpoint để resume vẫn lưu full model, nhưng tự dọn chỉ giữ vài checkpoint mới nhất.
+- Model dùng predict/apply được strip optimizer để nhẹ hơn: best_for_apply.keras và best_for_apply_inference.keras.
+- Batch/Epoch mặc định: 50 / 200 để batch shape cố định trên dataset 2100/450.
 - Train/val/test cục bộ, xuất JSON + CSV per-image.
 - Nếu best test mean_dice_ABC < --min-acc, fine-tune thêm, không train lại từ đầu.
 
 Chạy Colab/project root:
     python 6v1_unet_model.py --epochs 200 --batch-size 64 --min-acc 0.85 --auto-retrain-rounds 1
+    # Script sẽ tự đổi batch 64 -> 50 nếu bật fixed-shape để tránh batch lẻ 52/2.
 
 Lưu ý:
-- Nếu T4 OOM ở batch 64, giảm --batch-size còn 16/32. Code vẫn giữ default 64 theo yêu cầu.
-- best_for_apply.keras là model tốt nhất để file 7v1 dùng apply vào overlap_raw.
+- Mặc định dùng fixed-shape batch. Nếu pass batch 64 mà dataset 2100/450, script tự chọn batch 50 để tránh XLA/cuDNN compile shape lẻ.
+- best_for_apply.keras là bản nhẹ chỉ để predict/apply; checkpoint full vẫn dùng để resume train tiếp.
 """
 
 from __future__ import annotations
@@ -39,6 +42,8 @@ import numpy as np
 # Đổi bằng biến môi trường NST_TF_CPP_MIN_LOG_LEVEL nếu thật sự cần debug sâu.
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = os.environ.get("NST_TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("AUTOGRAPH_VERBOSITY", "0")
+# Tắt XLA auto-jit để tránh epoch đầu bị cuDNN/XLA autotune kéo quá lâu trên T4.
+os.environ.setdefault("TF_XLA_FLAGS", "--tf_xla_auto_jit=0")
 
 import tensorflow as tf
 from tensorflow import keras
@@ -46,6 +51,10 @@ from tensorflow.keras import layers
 
 # Ẩn bớt logger Python của TensorFlow, chỉ giữ lỗi quan trọng.
 tf.get_logger().setLevel("ERROR")
+try:
+    tf.config.optimizer.set_jit(False)
+except Exception:
+    pass
 
 
 # =========================================================
@@ -78,7 +87,7 @@ class TrainConfig:
     dataset_dir: str
     results_dir: str
     epochs: int = 200
-    batch_size: int = 64
+    batch_size: int = 50
     learning_rate: float = 1e-4
     min_acc: float = 0.85
     auto_retrain_rounds: int = 1
@@ -94,6 +103,12 @@ class TrainConfig:
     distill_loss_weight: float = 0.35
     show_summary: bool = False
     fit_verbose: int = 0
+    drop_remainder: bool = True
+    auto_fixed_batch: bool = True
+    smart_skip_good: bool = True
+    skip_student_when_teacher_good: bool = True
+    checkpoint_keep: int = 2
+    save_light_apply: bool = True
 
 
 def enable_mixed_precision(use_amp: bool) -> None:
@@ -245,7 +260,7 @@ def augment_sample(image: tf.Tensor, mask: tf.Tensor) -> Tuple[tf.Tensor, tf.Ten
     return image, mask
 
 
-def make_dataset(dataset_dir: Path, split: str, batch_size: int, shuffle: bool = False, augment: bool = False) -> Tuple[tf.data.Dataset, int]:
+def make_dataset(dataset_dir: Path, split: str, batch_size: int, shuffle: bool = False, augment: bool = False, drop_remainder: bool = False) -> Tuple[tf.data.Dataset, int]:
     image_paths, mask_a_paths, mask_b_paths, mask_c_paths = get_file_lists(dataset_dir, split)
     n = len(image_paths)
     print(f"[DATA] {split}: {n} samples")
@@ -256,9 +271,62 @@ def make_dataset(dataset_dir: Path, split: str, batch_size: int, shuffle: bool =
     ds = ds.map(load_sample, num_parallel_calls=AUTOTUNE)
     if augment:
         ds = ds.map(augment_sample, num_parallel_calls=AUTOTUNE)
-    ds = ds.batch(batch_size, drop_remainder=False)
-    ds = ds.prefetch(AUTOTUNE)
+    ds = ds.batch(batch_size, drop_remainder=drop_remainder)
+    # Prefetch thấp hơn để tránh RAM/VRAM bị căng khi batch lớn trên Colab T4.
+    ds = ds.prefetch(1)
     return ds, n
+
+def _divisors(n: int) -> List[int]:
+    if n <= 0:
+        return []
+    out: List[int] = []
+    for i in range(1, int(n ** 0.5) + 1):
+        if n % i == 0:
+            out.append(i)
+            if i * i != n:
+                out.append(n // i)
+    return sorted(out)
+
+
+def choose_fixed_batch_size(train_n: int, val_n: int, requested_batch: int, min_batch: int = 8) -> int:
+    """
+    Chọn batch size cố định để tránh batch lẻ làm TensorFlow/XLA/cuDNN compile/autotune lại shape.
+    Với train=2100 và val=450, requested=64 -> chọn 50 vì 2100/50=42, 450/50=9.
+    """
+    requested_batch = max(1, int(requested_batch))
+    if train_n % requested_batch == 0 and val_n % requested_batch == 0:
+        return requested_batch
+
+    # Ưu tiên các batch thực tế chạy ổn trên T4 và chia hết train/val.
+    preferred = [64, 50, 48, 40, 32, 30, 25, 24, 20, 16, 15, 12, 10, 8, 5, 4, 2, 1]
+    for b in preferred:
+        if b <= requested_batch and b >= min_batch and train_n % b == 0 and val_n % b == 0:
+            return b
+
+    common = sorted(set(_divisors(train_n)).intersection(_divisors(val_n)), reverse=True)
+    for b in common:
+        if b <= requested_batch and b >= min_batch:
+            return b
+    return requested_batch
+
+
+def print_shape_plan(train_n: int, val_n: int, batch_size: int, drop_remainder: bool) -> None:
+    train_steps = train_n // batch_size if drop_remainder else int(np.ceil(train_n / batch_size))
+    val_steps = val_n // batch_size if drop_remainder else int(np.ceil(val_n / batch_size))
+    dropped_train = train_n - train_steps * batch_size if drop_remainder else 0
+    dropped_val = val_n - val_steps * batch_size if drop_remainder else 0
+    print(
+        f"[SHAPE] static batch shape: ({batch_size}, {IMG_SIZE}, {IMG_SIZE}, {IMG_CHANNELS}) "
+        f"-> train_steps={train_steps}, val_steps={val_steps}, "
+        f"drop_train={dropped_train}, drop_val={dropped_val}",
+        flush=True,
+    )
+    if dropped_train or dropped_val:
+        print(
+            "[SHAPE][WARN] drop_remainder=True đang bỏ một ít sample cuối. "
+            "Muốn không bỏ sample thì chọn batch chia hết train/val hoặc tắt --drop-remainder.",
+            flush=True,
+        )
 
 
 def make_distill_dataset(ds: tf.data.Dataset, teacher: keras.Model) -> tf.data.Dataset:
@@ -274,7 +342,8 @@ def make_distill_dataset(ds: tf.data.Dataset, teacher: keras.Model) -> tf.data.D
         y.set_shape([None, IMG_SIZE, IMG_SIZE, NUM_OUTPUT_CHANNELS * 2])
         return x, y
 
-    return ds.map(add_soft, num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
+    # Không dùng AUTOTUNE ở đây vì teacher forward trong tf.data map có thể ăn RAM/VRAM rất mạnh.
+    return ds.map(add_soft, num_parallel_calls=1).prefetch(1)
 
 
 # =========================================================
@@ -468,14 +537,16 @@ CUSTOM_OBJECTS = {
 
 
 def compile_teacher(model: keras.Model, lr: float) -> keras.Model:
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr), loss=hybrid_loss, metrics=METRICS)
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr), loss=hybrid_loss, metrics=METRICS, jit_compile=False)
     return model
 
 
 def compile_student(model: keras.Model, lr: float, hard_weight: float, distill_weight: float) -> keras.Model:
-    keras.backend.set_value(CURRENT_HARD_LOSS_WEIGHT, hard_weight)
-    keras.backend.set_value(CURRENT_DISTILL_LOSS_WEIGHT, distill_weight)
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr), loss=student_distill_loss, metrics=METRICS)
+    CURRENT_HARD_LOSS_WEIGHT.assign(float(hard_weight))
+    CURRENT_DISTILL_LOSS_WEIGHT.assign(float(distill_weight))
+    # Nếu distill_weight <= 0: train student hard-label only, không cần teacher soft -> nhanh hơn nhiều.
+    loss_fn = hybrid_loss if distill_weight <= 0 else student_distill_loss
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr), loss=loss_fn, metrics=METRICS, jit_compile=False)
     return model
 
 
@@ -762,7 +833,7 @@ def print_model_brief(model: keras.Model, role: str, show_summary: bool = False)
     )
 
 
-def make_callbacks(results_dir: Path, role: str, patience: int, append_log: bool, target_epochs: int) -> List[keras.callbacks.Callback]:
+def make_callbacks(results_dir: Path, role: str, patience: int, append_log: bool, target_epochs: int, checkpoint_keep: int = 2) -> List[keras.callbacks.Callback]:
     checkpoint_dir = results_dir / f"checkpoints_{role}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     return [
@@ -781,6 +852,7 @@ def make_callbacks(results_dir: Path, role: str, patience: int, append_log: bool
             save_freq="epoch",
             verbose=0,
         ),
+        CheckpointRetention(checkpoint_dir=checkpoint_dir, keep=checkpoint_keep),
         keras.callbacks.EarlyStopping(
             monitor="val_mean_dice_abc",
             mode="max",
@@ -814,6 +886,8 @@ def train_role(
     results_dir: Path,
     patience: int,
     fit_verbose: int = 0,
+    checkpoint_keep: int = 2,
+    save_light: bool = True,
 ) -> keras.Model:
     if target_epochs <= initial_epoch:
         print(f"[TRAIN][{role}] target_epochs={target_epochs} <= initial_epoch={initial_epoch}, skip fit.")
@@ -826,12 +900,14 @@ def train_role(
         validation_data=val_ds,
         epochs=target_epochs,
         initial_epoch=initial_epoch,
-        callbacks=make_callbacks(results_dir, role=role, patience=patience, append_log=initial_epoch > 0, target_epochs=target_epochs),
+        callbacks=make_callbacks(results_dir, role=role, patience=patience, append_log=initial_epoch > 0, target_epochs=target_epochs, checkpoint_keep=checkpoint_keep),
         verbose=fit_verbose,
     )
     final_path = results_dir / f"final_{role}.keras"
     model.save(final_path)
-    print(f"[SAVE][{role}] Final model saved to {final_path}")
+    print(f"[SAVE][{role}] Final full model saved to {final_path}")
+    if save_light:
+        save_lightweight_model(model, results_dir / f"final_{role}_inference.keras")
     return model
 
 
@@ -845,33 +921,133 @@ def load_best_if_exists(results_dir: Path, role: str, compile_fn) -> keras.Model
     raise FileNotFoundError(f"Missing both {best_path} and {final_path}")
 
 
+def read_saved_split_score(results_dir: Path, role: str, split: str = "test") -> Optional[float]:
+    path = results_dir / "metric_reports" / f"{role}_{split}_metrics.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        score = data.get("mean_dice_ABC")
+        return None if score is None else float(score)
+    except Exception:
+        return None
+
+
+def best_model_exists(results_dir: Path, role: str) -> bool:
+    return (results_dir / f"best_{role}.keras").exists() or (results_dir / f"final_{role}.keras").exists()
+
+
+
+def save_lightweight_model(model: keras.Model, path: Path) -> None:
+    """Save model for inference only (no optimizer state) so predict file stays light."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Works on most tf.keras/Keras versions.
+        model.save(path, include_optimizer=False)
+    except TypeError:
+        # Fallback: clone uncompiled model + weights, then save.
+        inference_model = keras.models.clone_model(model)
+        inference_model.set_weights(model.get_weights())
+        inference_model.save(path)
+    except Exception as exc:
+        print(f"[WARN] Could not save lightweight model to {path}: {exc}", flush=True)
+        raise
+    try:
+        size_mb = path.stat().st_size / (1024 * 1024)
+        print(f"[SAVE][LIGHT] {path} | {size_mb:.1f} MB", flush=True)
+    except Exception:
+        print(f"[SAVE][LIGHT] {path}", flush=True)
+
+
+def save_lightweight_from_path(src_path: Path, dst_path: Path) -> None:
+    """Load full checkpoint/model compile=False, then save inference-only copy."""
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
+    print(f"[SAVE][LIGHT] strip optimizer: {src_path} -> {dst_path}", flush=True)
+    model = keras.models.load_model(src_path, custom_objects=CUSTOM_OBJECTS, compile=False)
+    save_lightweight_model(model, dst_path)
+
+
+class CheckpointRetention(keras.callbacks.Callback):
+    """Keep only the newest N epoch checkpoints to avoid many 300MB files."""
+
+    def __init__(self, checkpoint_dir: Path, keep: int = 2):
+        super().__init__()
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.keep = max(1, int(keep))
+
+    def on_epoch_end(self, epoch: int, logs=None):
+        ckpts = sorted(self.checkpoint_dir.glob("epoch_*.keras"), key=parse_epoch_from_path)
+        old = ckpts[:-self.keep]
+        for f in old:
+            try:
+                f.unlink()
+                print(f"[CLEAN][CKPT] removed old checkpoint: {f.name}", flush=True)
+            except Exception as exc:
+                print(f"[WARN][CKPT] could not remove {f}: {exc}", flush=True)
+
+def maybe_smart_skip_role(results_dir: Path, role: str, min_acc: float, enabled: bool) -> bool:
+    """Return True nếu role đã có best model + metrics đạt ngưỡng nên không cần train tiếp."""
+    if not enabled or not best_model_exists(results_dir, role):
+        return False
+    score = read_saved_split_score(results_dir, role, split="test")
+    if score is not None and score >= min_acc:
+        print(
+            f"[SMART][{role}] saved test mean_dice_ABC={score:.4f} >= target={min_acc:.2f} "
+            f"-> skip training, reuse best_{role}.keras",
+            flush=True,
+        )
+        return True
+    if score is not None:
+        print(
+            f"[SMART][{role}] saved test mean_dice_ABC={score:.4f} < target={min_acc:.2f} "
+            f"-> continue training/resume checkpoint",
+            flush=True,
+        )
+    return False
+
+
 def choose_best_for_apply(results_dir: Path, all_metrics: Dict[str, Dict[str, Dict[str, float]]]) -> str:
     best_role = max(all_metrics.keys(), key=lambda r: all_metrics[r]["test"]["mean_dice_ABC"])
     src = results_dir / f"best_{best_role}.keras"
     if not src.exists():
         src = results_dir / f"final_{best_role}.keras"
-    dst = results_dir / "best_for_apply.keras"
-    shutil.copy2(src, dst)
 
-    # Alias để script 7v1 cũ hoặc notebook dễ load.
+    # Giữ src là full model để resume/train tiếp. File apply/predict thì strip optimizer cho nhẹ.
+    dst = results_dir / "best_for_apply.keras"
+    dst_infer = results_dir / "best_for_apply_inference.keras"
+    role_infer = results_dir / f"best_{best_role}_inference.keras"
+
+    save_lightweight_from_path(src, dst)
+    try:
+        shutil.copy2(dst, dst_infer)
+        shutil.copy2(dst, role_infer)
+    except Exception as exc:
+        print(f"[WARN] Could not create inference aliases: {exc}", flush=True)
+
+    # Alias để script 7v1 cũ hoặc notebook dễ load. Tất cả alias này là bản nhẹ.
     for alias in ["best_unet.keras", "best_hybrid_unet.keras"]:
         try:
-            shutil.copy2(src, results_dir / alias)
+            shutil.copy2(dst, results_dir / alias)
         except Exception as exc:
             print(f"[WARN] Could not create alias {alias}: {exc}")
 
     summary_path = results_dir / "best_model_summary.json"
     summary = {
         "best_role": best_role,
-        "source_model": str(src),
-        "best_for_apply": str(dst),
+        "source_full_model_for_resume": str(src),
+        "best_for_apply_lightweight": str(dst),
+        "best_for_apply_inference": str(dst_infer),
+        "note": "Checkpoint/best_{role}.keras giữ full optimizer để resume; best_for_apply*.keras là bản nhẹ để predict.",
         "test_mean_dice_ABC": all_metrics[best_role]["test"]["mean_dice_ABC"],
         "test_accuracy_percent_main": all_metrics[best_role]["test"]["accuracy_percent_main"],
         "all_metrics": all_metrics,
     }
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    print(f"[BEST] {best_role} chosen for apply. Saved: {dst}")
+    print(f"[BEST] {best_role} chosen for apply. Lightweight model saved: {dst}")
+    print(f"[BEST] Full source for resume kept: {src}")
     print(f"[BEST] Summary: {summary_path}")
     return best_role
 
@@ -885,7 +1061,7 @@ def main(args: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--dataset-dir", type=str, default=str(DATASET_DIR_DEFAULT))
     parser.add_argument("--results-dir", type=str, default=str(RESULTS_DIR_DEFAULT))
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--min-acc", type=float, default=0.85, help="Minimum mean_dice_ABC required on test set.")
     parser.add_argument("--auto-retrain-rounds", type=int, default=1, help="Fine-tune thêm nếu test acc < min-acc.")
@@ -901,6 +1077,14 @@ def main(args: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--distill-loss-weight", type=float, default=0.35)
     parser.add_argument("--show-summary", action="store_true", help="In full model.summary(). Mặc định tắt để terminal sạch.")
     parser.add_argument("--fit-verbose", type=int, default=0, choices=[0, 1, 2], help="Keras fit verbose. Mặc định 0 vì đã có CleanEpochLogger.")
+    parser.add_argument("--drop-remainder", dest="drop_remainder", action="store_true", default=True, help="Drop batch cuối để giữ batch shape cố định. Mặc định bật.")
+    parser.add_argument("--no-drop-remainder", dest="drop_remainder", action="store_false", help="Tắt drop_remainder nếu muốn dùng toàn bộ sample, có thể làm XLA/cuDNN autotune lại shape lẻ.")
+    parser.add_argument("--auto-fixed-batch", dest="auto_fixed_batch", action="store_true", default=True, help="Tự đổi batch về số chia hết train/val để tránh batch lẻ. Mặc định bật.")
+    parser.add_argument("--no-auto-fixed-batch", dest="auto_fixed_batch", action="store_false", help="Không tự chỉnh batch size.")
+    parser.add_argument("--no-smart-skip-good", dest="smart_skip_good", action="store_false", default=True, help="Tắt cơ chế nếu best model đã đạt min_acc thì không train lại.")
+    parser.add_argument("--train-student-even-if-teacher-good", dest="skip_student_when_teacher_good", action="store_false", default=True, help="Ép train Student kể cả khi Teacher đã đạt min_acc.")
+    parser.add_argument("--checkpoint-keep", type=int, default=2, help="Chỉ giữ N checkpoint epoch mới nhất mỗi role để Drive không phình. Mặc định 2.")
+    parser.add_argument("--no-light-apply", dest="save_light_apply", action="store_false", default=True, help="Tắt lưu model predict nhẹ nếu cần debug.")
     ns = parser.parse_args(args)
 
     cfg = TrainConfig(
@@ -923,19 +1107,43 @@ def main(args: Optional[Sequence[str]] = None) -> None:
         distill_loss_weight=ns.distill_loss_weight,
         show_summary=ns.show_summary,
         fit_verbose=ns.fit_verbose,
+        drop_remainder=ns.drop_remainder,
+        auto_fixed_batch=ns.auto_fixed_batch,
+        smart_skip_good=ns.smart_skip_good,
+        skip_student_when_teacher_good=ns.skip_student_when_teacher_good,
+        checkpoint_keep=ns.checkpoint_keep,
+        save_light_apply=ns.save_light_apply,
     )
 
     dataset_dir = Path(cfg.dataset_dir)
     results_dir = Path(cfg.results_dir)
     paths = ensure_dirs(results_dir)
+
+    # Đếm sample trước để tự chọn batch size giữ shape cố định.
+    train_n = len(get_file_lists(dataset_dir, "train")[0])
+    val_n = len(get_file_lists(dataset_dir, "val")[0])
+    _ = get_file_lists(dataset_dir, "test")
+
+    requested_batch = cfg.batch_size
+    if cfg.auto_fixed_batch and cfg.drop_remainder:
+        fixed_batch = choose_fixed_batch_size(train_n, val_n, requested_batch)
+        if fixed_batch != requested_batch:
+            print(
+                f"[SHAPE] requested batch={requested_batch} tạo batch lẻ "
+                f"(train={train_n}, val={val_n}) -> auto fixed batch={fixed_batch}",
+                flush=True,
+            )
+            cfg.batch_size = fixed_batch
+    print_shape_plan(train_n, val_n, cfg.batch_size, cfg.drop_remainder)
+
+    # Ghi config sau khi đã auto-fix batch để report đúng batch thực tế.
     with open(results_dir / "train_config.json", "w", encoding="utf-8") as f:
         json.dump(asdict(cfg), f, ensure_ascii=False, indent=2)
 
     enable_mixed_precision(cfg.use_amp)
 
-    train_ds, _ = make_dataset(dataset_dir, "train", cfg.batch_size, shuffle=True, augment=True)
-    val_ds, _ = make_dataset(dataset_dir, "val", cfg.batch_size, shuffle=False, augment=False)
-    _ = get_file_lists(dataset_dir, "test")
+    train_ds, _ = make_dataset(dataset_dir, "train", cfg.batch_size, shuffle=True, augment=True, drop_remainder=cfg.drop_remainder)
+    val_ds, _ = make_dataset(dataset_dir, "val", cfg.batch_size, shuffle=False, augment=False, drop_remainder=cfg.drop_remainder)
 
     teacher_compile = lambda m: compile_teacher(m, cfg.learning_rate)
     student_compile = lambda m: compile_student(m, cfg.learning_rate, cfg.hard_loss_weight, cfg.distill_loss_weight)
@@ -944,6 +1152,12 @@ def main(args: Optional[Sequence[str]] = None) -> None:
     student_model: Optional[keras.Model] = None
     teacher_initial_epoch = 0
     student_initial_epoch = 0
+
+    # Nếu đã có model + metric đạt ngưỡng trong results/metric_reports thì không train lại.
+    if maybe_smart_skip_role(results_dir, "teacher", cfg.min_acc, cfg.smart_skip_good):
+        cfg.train_teacher = False
+    if maybe_smart_skip_role(results_dir, "student", cfg.min_acc, cfg.smart_skip_good):
+        cfg.train_student = False
 
     if cfg.train_teacher:
         teacher_model, teacher_initial_epoch = build_or_resume_role(
@@ -968,6 +1182,12 @@ def main(args: Optional[Sequence[str]] = None) -> None:
             compile_fn=student_compile,
         )
         print_model_brief(student_model, "student", show_summary=cfg.show_summary)
+    else:
+        try:
+            student_model = load_best_if_exists(results_dir, "student", student_compile)
+            print("[TRAIN][student] skipped, using loaded student.")
+        except FileNotFoundError:
+            student_model = None
 
     target_epochs = cfg.epochs
     best_role = "teacher"
@@ -987,6 +1207,8 @@ def main(args: Optional[Sequence[str]] = None) -> None:
                 results_dir=results_dir,
                 patience=cfg.patience,
                 fit_verbose=cfg.fit_verbose,
+                checkpoint_keep=cfg.checkpoint_keep,
+                save_light=cfg.save_light_apply,
             )
             teacher_model = load_best_if_exists(results_dir, "teacher", teacher_compile)
         elif teacher_model is not None:
@@ -995,10 +1217,36 @@ def main(args: Optional[Sequence[str]] = None) -> None:
         if teacher_model is None:
             raise RuntimeError("Teacher model is required for student distillation.")
 
+        # Nếu Teacher đã đạt target, dùng Teacher làm best_for_apply và không train Student trừ khi người dùng ép train.
+        if cfg.train_student and cfg.skip_student_when_teacher_good:
+            teacher_test_score = read_saved_split_score(results_dir, "teacher", split="test")
+            if teacher_test_score is None or cfg.train_teacher:
+                print("[SMART][teacher] evaluating Teacher on test before deciding Student training...", flush=True)
+                teacher_test_metrics = evaluate_split(
+                    teacher_model, dataset_dir, "test", cfg.batch_size, paths["metric_reports"], model_name="teacher"
+                )
+                teacher_test_score = teacher_test_metrics.get("mean_dice_ABC")
+            if teacher_test_score is not None and teacher_test_score >= cfg.min_acc:
+                print(
+                    f"[SMART][teacher] test mean_dice_ABC={teacher_test_score:.4f} >= target={cfg.min_acc:.2f} "
+                    f"-> skip Student to save time. Add --train-student-even-if-teacher-good nếu vẫn muốn train Student.",
+                    flush=True,
+                )
+                cfg.train_student = False
+                # Không đưa model Student mới khởi tạo vào so sánh nếu chưa train.
+                if student_initial_epoch == 0 and not best_model_exists(results_dir, "student"):
+                    student_model = None
+
         # Student học hard label + soft output của teacher.
+        # Nếu --distill-loss-weight 0 thì train hard-label only để chạy nhanh, không gọi teacher trong mỗi batch.
         if cfg.train_student and student_model is not None:
-            train_ds_student = make_distill_dataset(train_ds, teacher_model)
-            val_ds_student = make_distill_dataset(val_ds, teacher_model)
+            if cfg.distill_loss_weight > 0:
+                train_ds_student = make_distill_dataset(train_ds, teacher_model)
+                val_ds_student = make_distill_dataset(val_ds, teacher_model)
+            else:
+                print("[TRAIN][student] distill_weight=0 -> hard-label only, skip teacher soft labels for speed.", flush=True)
+                train_ds_student = train_ds
+                val_ds_student = val_ds
             student_model = train_role(
                 model=student_model,
                 role="student",
@@ -1009,6 +1257,8 @@ def main(args: Optional[Sequence[str]] = None) -> None:
                 results_dir=results_dir,
                 patience=cfg.patience,
                 fit_verbose=cfg.fit_verbose,
+                checkpoint_keep=cfg.checkpoint_keep,
+                save_light=cfg.save_light_apply,
             )
             student_model = load_best_if_exists(results_dir, "student", student_compile)
 
